@@ -1,0 +1,187 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: |
+  This Cloudformation yaml/file builds an infrastructure and build and application of a project called "Contact List"
+# PARAMETERS DEFINITION START
+Parameters:
+  MyVPC:
+    Description: VPC Id of your existing account
+    Type: AWS::EC2::VPC::Id
+
+  KeyName:
+    Description: Please enter your key pair
+    Type: AWS::EC2::KeyPair::KeyName
+
+  Subnets:
+    Description: Please select your two subnets used by ALB
+    Type: List<AWS::EC2::Subnet::Id> # creates a checkbox style selection options
+
+  DBSubnets:
+    Description: Please select your two subnets used by RDS DB
+    Type: List<AWS::EC2::Subnet::Id> # creates a checkbox style selection options
+
+  HostedId:
+    Description: Select your hostedid.
+    Type: AWS::Route53::HostedZone::Id
+  
+  ContactDomainName:
+    Description: Full domain name for the Application. For instance, contact.tuzen.uk
+    Type: String
+    AllowedPattern: (?!-)[a-zA-Z0-9-.]{1,63}(?<!-) # creating a strict definition pattern that can be defined
+
+# RESOURCE DEFINITION STARTS 
+Resources:
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP for application
+      SecurityGroupIngress: 
+        - IpProtocol: tcp
+          CidrIp: 0.0.0.0/0
+          FromPort: 80
+          ToPort: 80
+      VpcId: !Ref MyVPC
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP for application
+      SecurityGroupIngress: 
+        - IpProtocol: tcp
+          SourceSecurityGroupId: !GetAtt ALBSecurityGroup.GroupId
+          FromPort: 80
+          ToPort: 80
+        - IpProtocol: tcp
+          CidrIp: 0.0.0.0/0
+          FromPort: 22
+          ToPort: 22
+      VpcId: !Ref MyVPC
+
+  MyDBSecurityGroup:
+    Type: AWS::RDS::DBSecurityGroup
+    Properties:
+      DBSecurityGroupIngress: # Required
+        - EC2SecurityGroupId: !GetAtt EC2SecurityGroup.GroupId
+      GroupDescription: Back-end Database # Required
+
+  WebServerLT:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: ami-0cff7528ff583bf9a
+        InstanceType: t2.micro
+        KeyName: !Ref KeyName     #parameter definition is needed
+        SecurityGroupIds:
+          - !GetAtt EC2SecurityGroup.GroupId #definition is needed
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: 
+              - Key: Name
+                Value: !Sub Web Server of ${AWS::StackName} Stack #add variable type data in the definition
+        UserData: 
+          Fn::Base64:
+            !Sub    # In order to assign a value to a variable which will be used in another place, !Sub allow such variable definition
+              - |
+                #! /bin/bash
+                yum update -y
+                yum install python3 -y
+                yum install git -y
+                pip3 install flask
+                pip3 install flask_mysql
+                echo "${MyDBURI}" > /home/ec2-user/dbserver.endpoint
+                cd /home/ec2-user
+                git clone https://github.com/utusen/Contact-List-Application.git
+                cd Contact-List-Application
+                python3 contact-list-app.py
+              - MyDBURI: !GetAtt MyDatabaseServer.Endpoint.Address
+  
+  WebServerTG:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      UnhealthyThresholdCount: 3
+      HealthyThresholdCount: 2
+      VpcId: !Ref MyVPC #that requires parameter definition
+
+  ApplicationLoadBalancer:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Properties:
+      IpAddressType: ipv4
+      Scheme: internet-facing
+      SecurityGroups:
+        - !GetAtt ALBSecurityGroup.GroupId
+      Subnets: !Ref Subnets #that requires definition
+      Type: application
+
+  ALBListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions: #required
+        - TargetGroupArn: !Ref WebServerTG
+          Type: forward
+      LoadBalancerArn: !Ref ApplicationLoadBalancer #required
+      Port: 80 #required
+      Protocol: HTTP #required
+
+  WebServerASG:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    Properties:
+      AvailabilityZones:
+        !GetAZs "" #defining without
+      DesiredCapacity: 2
+      HealthCheckGracePeriod: 300
+      HealthCheckType: ELB
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebServerLT
+        Version: !GetAtt WebServerLT.LatestVersionNumber
+      MaxSize: 3 #required
+      MinSize: 1 #required
+      TargetGroupARNs:
+        - !Ref WebServerTG
+  
+  MyDatabaseServer:
+    Type: AWS::RDS::DBInstance
+    Properties: 
+      AllocatedStorage: 20
+      AllowMajorVersionUpgrade: false
+      AutoMinorVersionUpgrade: false
+      BackupRetentionPeriod: 0
+      DBInstanceClass: db.t2.micro
+      DBInstanceIdentifier: contact-list-app
+      DBName: techpro
+      DBSubnetGroupName: !Ref MyDBSubnetGroup #definition is needed
+      DBSecurityGroups: 
+        - !Ref MyDBSecurityGroup #definition is needed
+      Engine: MySQL
+      EngineVersion: 8.0.35
+      MasterUsername: admin
+      MasterUserPassword: techpro12345
+      Port: 3306
+      PubliclyAccessible: true
+
+  MyDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties: 
+      DBSubnetGroupDescription: Subnets available for the RDS DB Instance
+      SubnetIds: !Ref DBSubnets #definition is needed
+
+  ContactDNSName:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneId: !Ref HostedId #definition is needed
+      RecordSets:
+        - Name: !Ref ContactDomainName #definition is needed
+          Type: A
+          AliasTarget:
+            HostedZoneId: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID #HostedZoneID of loadbalancer that's attached
+            DNSName: !GetAtt ApplicationLoadBalancer.DNSName
+
+# OUTPUTS DEFINITION STARTS 
+# The desired outputs are written to screen 
+Outputs:
+  WebsiteURL:
+    Value: !Sub 
+      - http://${Address}
+      - Address: !Ref ContactDomainName
+    Description: Contact List Application Load Balancer URL
